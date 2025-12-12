@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h1 class="mb-4">Historical Data</h1>
+
+<form method="POST" action="{{ url_for('historical_data') }}" class="mb-4 p-3 border rounded bg-light">
+    <div class="row g-3 align-items-center">
+        <div class="col-auto">
+            <label for="table" class="col-form-label">Table Name:</label>
+        </div>
+        <div class="col-auto">
+            <input type="text" id="table" name="table" class="form-control" value="{{ table_name if table_name else 'real_call_metrics' }}">
+        </div>
+        <div class="col-auto">
+            <label for="ts_column" class="col-form-label">Timestamp Column:</label>
+        </div>
+        <div class="col-auto">
+            <input type="text" id="ts_column" name="ts_column" class="form-control" value="{{ ts_column if ts_column else 'ds' }}">
+        </div>
+        <div class="col-auto">
+            <label for="y_column" class="col-form-label">Value Column:</label>
+        </div>
+        <div class="col-auto">
+            <input type="text" id="y_column" name="y_column" class="form-control" value="{{ y_column if y_column else 'y' }}">
+        </div>
+        <div class="col-auto">
+            <button type="submit" class="btn btn-primary">Load Data</button>
+        </div>
+    </div>
+</form>
+
+{% if data_exists %}
+    <div class="table-responsive">
+        {{ historical_table_html | safe }}
+    </div>
+{% else %}
+    <p>No historical data loaded yet. Please specify table and column names and click "Load Data".</p>
+{% endif %}
+{% endblock %}

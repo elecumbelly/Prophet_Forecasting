@@ -1,0 +1,173 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h1 class="mb-4">Generate Forecast</h1>
+
+<form method="POST" action="{{ url_for('forecast') }}" class="mb-4 p-3 border rounded bg-light">
+    <div class="row g-3 align-items-center mb-3">
+        <div class="col-auto">
+            <label for="table" class="col-form-label">Table Name:</label>
+        </div>
+        <div class="col-auto">
+            <input type="text" id="table" name="table" class="form-control" value="real_call_metrics">
+        </div>
+        <div class="col-auto">
+            <label for="ts_column" class="col-form-label">Timestamp Column:</label>
+        </div>
+        <div class="col-auto">
+            <input type="text" id="ts_column" name="ts_column" class="form-control" value="ds">
+        </div>
+        <div class="col-auto">
+            <label for="y_column" class="col-form-label">Value Column:</label>
+        </div>
+        <div class="col-auto">
+            <input type="text" id="y_column" name="y_column" class="form-control" value="y">
+        </div>
+    </div>
+
+    <div class="row g-3 align-items-center mb-3">
+        <div class="col-auto">
+            <label for="freq" class="col-form-label">Frequency:</label>
+        </div>
+        <div class="col-auto">
+            <select id="freq" name="freq" class="form-select">
+                <option value="D" selected>Daily</option>
+                <option value="W">Weekly</option>
+                <option value="M">Monthly</option>
+            </select>
+        </div>
+        <div class="col-auto">
+            <label for="resample_to_freq" class="col-form-label">Resample To (e.g., 'H', 'D'):</label>
+        </div>
+        <div class="col-auto">
+            <input type="text" id="resample_to_freq" name="resample_to_freq" class="form-control" value="" placeholder="Optional (e.g., '15min', 'H', 'D')">
+        </div>
+        <div class="col-auto">
+            <label for="horizon" class="col-form-label">Forecast Horizon:</label>
+        </div>
+        <div class="col-auto">
+            <input type="text" id="horizon" name="horizon" class="form-control" value="365D" placeholder="e.g., 90D, 180D, 365D">
+        </div>
+        <div class="col-auto">
+            <label for="training_window_duration" class="col-form-label">Training Window Duration:</label>
+        </div>
+        <div class="col-auto">
+            <input type="text" id="training_window_duration" name="training_window_duration" class="form-control" value="730 days" placeholder="e.g., '365 days', '2Y'">
+        </div>
+        <div class="col-auto">
+            <label for="series_name" class="col-form-label">Series Name:</label>
+        </div>
+        <div class="col-auto">
+            <input type="text" id="series_name" name="series_name" class="form-control" value="default_series">
+        </div>
+    </div>
+
+    <div class="row g-3 align-items-center mb-3">
+        <div class="col-auto">
+            <label for="regressors" class="col-form-label">Additional Regressors:</label>
+        </div>
+        <div class="col-auto" style="min-width: 200px;">
+            <select id="regressors" name="regressors" class="form-select" multiple size="4">
+                <!-- Options populated by JS -->
+            </select>
+            <div class="form-text">Hold Ctrl/Cmd to select multiple.</div>
+        </div>
+        <div class="col-auto">
+            <button type="button" class="btn btn-sm btn-outline-secondary" onclick="loadColumns()">Refresh Columns</button>
+        </div>
+        <div class="col-auto ms-3">
+            <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="auto_tune" name="auto_tune">
+                <label class="form-check-label" for="auto_tune">
+                    Auto-tune Hyperparameters
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-3">
+        <div class="col-auto">
+            <button type="submit" class="btn btn-success">Generate Forecast</button>
+        </div>
+    </div>
+</form>
+
+{% if data_exists %}
+    <h2 class="mt-5">Forecast Results for {{ series_name }}</h2>
+
+    {% if forecast_table_html %}
+        <h3 class="mt-4">Last 5 Forecast Rows</h3>
+        <div class="table-responsive">
+            {{ forecast_table_html | safe }}
+        </div>
+    {% endif %}
+
+    {% if forecast_plot %}
+        <h3 class="mt-4">Forecast Plot</h3>
+        <img src="{{ forecast_plot }}" class="img-fluid border rounded shadow-sm mb-4" alt="Forecast Plot">
+    {% endif %}
+
+    {% if components_plot %}
+        <h3 class="mt-4">Forecast Components Plot</h3>
+        <img src="{{ components_plot }}" class="img-fluid border rounded shadow-sm" alt="Forecast Components Plot">
+    {% endif %}
+
+    {% if day_breakdown_plot %}
+        <h3 class="mt-4">Actual Calls by Day of Week</h3>
+        <img src="{{ day_breakdown_plot }}" class="img-fluid border rounded shadow-sm" alt="Day Breakdown Plot">
+    {% endif %}
+
+{% else %}
+    <p>Use the form above to generate a forecast.</p>
+{% endif %}
+
+<script>
+    const tableInput = document.getElementById('table');
+    const regressorSelect = document.getElementById('regressors');
+
+    async function loadColumns() {
+        const tableName = tableInput.value;
+        if (!tableName) return;
+        
+        // Save current selection
+        const currentSelection = Array.from(regressorSelect.selectedOptions).map(opt => opt.value);
+
+        try {
+            regressorSelect.innerHTML = '<option disabled>Loading...</option>';
+            const response = await fetch(`/get_columns/${tableName}`);
+            const data = await response.json();
+            
+            regressorSelect.innerHTML = '';
+            if (data.columns) {
+                const tsCol = document.getElementById('ts_column').value;
+                const yCol = document.getElementById('y_column').value;
+
+                data.columns.forEach(col => {
+                    // Skip ts and y columns to reduce confusion
+                    if (col !== tsCol && col !== yCol) {
+                        const option = document.createElement('option');
+                        option.value = col;
+                        option.text = col;
+                        if (currentSelection.includes(col)) {
+                            option.selected = true;
+                        }
+                        regressorSelect.add(option);
+                    }
+                });
+            } else if (data.error) {
+                regressorSelect.innerHTML = `<option disabled>Error: ${data.error}</option>`;
+            }
+        } catch (error) {
+            console.error('Error loading columns:', error);
+            regressorSelect.innerHTML = '<option disabled>Error loading columns</option>';
+        }
+    }
+
+    tableInput.addEventListener('change', loadColumns);
+    document.getElementById('ts_column').addEventListener('change', loadColumns);
+    document.getElementById('y_column').addEventListener('change', loadColumns);
+    
+    // Initial load
+    document.addEventListener('DOMContentLoaded', loadColumns);
+</script>
+{% endblock %}

@@ -1,0 +1,23 @@
+[project]
+name = "prophet-forecasting-tool"
+version = "0.1.0"
+description = "Time series forecasting utility that uses Prophet to forecast call centre volumes."
+dependencies = [
+    "prophet",
+    "pandas",
+    "sqlalchemy",
+    "psycopg2-binary",
+    "pydantic",
+    "pydantic-settings",
+    "matplotlib",
+    "python-dotenv",
+    "scikit-learn",
+    "Flask",
+]
+
+[project.scripts]
+prophet_forecaster = "prophet_forecasting_tool.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
