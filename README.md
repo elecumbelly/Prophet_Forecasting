@@ -82,7 +82,7 @@ If you don't have existing call center data, you can use the provided helper scr
 If you have your own data in CSV format, you can use the `import_real_data.py` script. This script expects a CSV file with specific column names (like 'date', 'Incoming Calls', etc.) and imports it into a table named `real_call_metrics`.
 
 1.  **Place your CSV file:** Ensure your CSV file (e.g., `Call Center Data.csv`) is located at:
-    `/Users/sspence/coding_projects/Learnin/raw_data/Call Center Data.csv`
+    `../raw_data/Call Center Data.csv` (relative to this project directory)
 
 2.  **Run the import script:**
     ```bash
@@ -127,6 +127,18 @@ A Flask web application is provided for interactive use.
 
 -   **Port in use:** If port 5001 is busy, the server won't start. Check for other running processes.
 -   **Database Errors:** Check `app.log` in the project root if you encounter connection issues. Ensure your `.env` is correct.
+
+## React Front End (shadcn/ui)
+
+A Next.js + Tailwind + shadcn/ui front end lives in `frontend/` for a richer UI that calls the Flask API.
+
+1.  Start the Flask API as above (defaults to http://127.0.0.1:5001).
+2.  Run the React app:
+    ```bash
+    cd frontend
+    NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:5001 npm run dev
+    ```
+    Visit http://localhost:3000 and use `call_center_metrics` with `ts`/`y` for the seeded dummy data.
 
 ## CLI Usage
 

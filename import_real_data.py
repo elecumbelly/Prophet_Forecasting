@@ -1,6 +1,7 @@
 import pandas as pd
 from sqlalchemy import create_engine, text
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 import logging
 
@@ -20,7 +21,7 @@ PGDATABASE = os.getenv("PGDATABASE", "prophet_forecast_db")
 
 DATABASE_URL = f"postgresql+psycopg2://{PGUSER}:{PGPASSWORD}@{PGHOST}:{PGPORT}/{PGDATABASE}"
 
-CSV_FILE_PATH = "/Users/sspence/coding_projects/Learnin/raw_data/Call Center Data.csv"
+CSV_FILE_PATH = str(Path(__file__).parent.parent / "raw_data/Call Center Data.csv")
 TABLE_NAME = "real_call_metrics"
 
 def clean_column_name(col_name: str) -> str:
