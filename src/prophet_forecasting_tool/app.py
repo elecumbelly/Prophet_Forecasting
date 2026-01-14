@@ -27,6 +27,16 @@ logger = logging.getLogger(__name__)
 settings = Settings()
 engine = create_engine(settings.DATABASE_URL)
 
+
+@app.after_request
+def add_cors_headers(response):
+    """Add basic CORS headers so a separate front end (e.g., Next.js) can call the API."""
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
+    return response
+
+
 OUTPUT_DIR = pathlib.Path("./outputs_web")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -136,6 +146,103 @@ def forecast():
             return render_template('forecast.html', data_exists=False)
             
     return render_template('forecast.html', data_exists=False)
+
+
+def _parse_optional_date(value):
+    """Safely parse a date/time value from JSON inputs."""
+    if not value:
+        return None
+    try:
+        return pd.to_datetime(value)
+    except Exception as exc:
+        logger.warning(f"Could not parse date '{value}': {exc}")
+        return None
+
+
+@app.route('/api/historical_data', methods=['POST', 'OPTIONS'])
+def api_historical_data():
+    """JSON API: return recent historical data for a given table/column set."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+
+    payload = request.get_json(silent=True) or {}
+    table_name = payload.get('table', 'real_call_metrics')
+    ts_column = payload.get('ts_column', 'ds')
+    y_column = payload.get('y_column', 'y')
+    columns = payload.get('columns')
+    resample_to_freq = payload.get('resample_to_freq')
+    start = _parse_optional_date(payload.get('start'))
+    end = _parse_optional_date(payload.get('end'))
+
+    try:
+        df = load_time_series(
+            engine,
+            table=table_name,
+            ts_column=ts_column,
+            y_column=y_column,
+            columns_to_load=columns,
+            resample_to_freq=resample_to_freq,
+            start=start,
+            end=end,
+        )
+        max_rows = int(payload.get('max_rows', 500))
+        data_preview = df.tail(max_rows)
+        return jsonify({
+            'table': table_name,
+            'row_count': len(df),
+            'columns': list(df.columns),
+            'preview': data_preview.to_dict(orient='records'),
+        })
+    except Exception as e:
+        logger.exception("Error loading historical data (API)")
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/api/forecast', methods=['POST', 'OPTIONS'])
+def api_forecast():
+    """JSON API: run a forecast and return plots + tail of the forecast dataframe."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+
+    payload = request.get_json(silent=True) or {}
+    regressors = payload.get('regressors') or []
+    if isinstance(regressors, str):
+        regressors = [r.strip() for r in regressors.split(',') if r.strip()]
+
+    try:
+        results = forecasting_service.get_forecast(
+            table_name=payload.get('table', 'real_call_metrics'),
+            ts_column=payload.get('ts_column', 'ds'),
+            y_column=payload.get('y_column', 'y'),
+            freq=payload.get('freq', 'D'),
+            horizon=payload.get('horizon', '365D'),
+            series_name=payload.get('series_name', 'default_series'),
+            regressors=regressors,
+            auto_tune=bool(payload.get('auto_tune', False)),
+            n_jobs=int(payload.get('n_jobs', -1)),
+            resample_to_freq=payload.get('resample_to_freq'),
+            training_window_duration=payload.get('training_window_duration', "730 days"),
+        )
+
+        preview_rows = int(payload.get('preview_rows', 50))
+        forecast_df = results['forecast_df']
+        preview_df = forecast_df.tail(preview_rows)
+
+        return jsonify({
+            'series_name': results['series_name'],
+            'row_count': len(forecast_df),
+            'preview': preview_df.to_dict(orient='records'),
+            'forecast_plot': results.get('forecast_plot'),
+            'components_plot': results.get('components_plot'),
+            'day_breakdown_plot': results.get('day_breakdown_plot'),
+        })
+    except ValueError as e:
+        logger.warning(f"Input error in API forecast: {e}")
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        logger.exception("Unexpected error in API forecast")
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/outputs_web/<filename>')
 def serve_output_file(filename):
