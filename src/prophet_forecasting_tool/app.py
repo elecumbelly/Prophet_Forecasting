@@ -185,7 +185,7 @@ def api_historical_data():
             start=start,
             end=end,
         )
-        max_rows = int(payload.get('max_rows', 500))
+        max_rows = min(int(payload.get('max_rows', 500)), 10000)
         data_preview = df.tail(max_rows)
         return jsonify({
             'table': table_name,
@@ -218,7 +218,7 @@ def api_forecast():
             horizon=payload.get('horizon', '365D'),
             series_name=payload.get('series_name', 'default_series'),
             regressors=regressors,
-            auto_tune=bool(payload.get('auto_tune', False)),
+            auto_tune=str(payload.get('auto_tune', 'false')).lower() in ('true', '1', 'yes'),
             n_jobs=int(payload.get('n_jobs', -1)),
             resample_to_freq=payload.get('resample_to_freq'),
             training_window_duration=payload.get('training_window_duration', "730 days"),
@@ -250,4 +250,4 @@ def serve_output_file(filename):
     return send_from_directory(OUTPUT_DIR, filename)
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    app.run(debug=False, host='127.0.0.1', port=5001)

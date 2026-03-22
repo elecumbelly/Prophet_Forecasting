@@ -115,6 +115,7 @@ export default function Home() {
   const [histEnd, setHistEnd] = useState("");
   const [histResample, setHistResample] = useState("");
   const [maxRows, setMaxRows] = useState(200);
+  const [notes, setNotes] = useState("");
 
   const [historical, setHistorical] = useState<HistoricalResponse | null>(
     null
@@ -414,6 +415,8 @@ export default function Home() {
                       <Textarea
                         placeholder="Describe this run so teammates know what changed"
                         className="min-h-[80px]"
+                        value={notes}
+                        onChange={(e) => setNotes(e.target.value)}
                       />
                     </div>
                   </div>
@@ -621,9 +624,12 @@ export default function Home() {
                       <Input
                         type="number"
                         value={maxRows}
-                        onChange={(e) => setMaxRows(Number(e.target.value))}
+                        onChange={(e) => {
+                          const val = Math.max(50, Math.min(10000, Number(e.target.value) || 50));
+                          setMaxRows(val);
+                        }}
                         min={50}
-                        max={1000}
+                        max={10000}
                       />
                     </div>
                   </div>
