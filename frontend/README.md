@@ -12,7 +12,7 @@ React/Next.js front end styled with shadcn/ui + Tailwind that sits on top of the
 cd frontend
 NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:5001 pnpm dev
 ```
-Open http://localhost:3000 to use the UI.
+Open http://localhost:3001 to use the UI.
 
 ## What it calls
 - `GET /get_columns/<table>` to load column names
