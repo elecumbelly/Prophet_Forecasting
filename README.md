@@ -136,7 +136,7 @@ A Next.js + Tailwind + shadcn/ui front end lives in `frontend/` for a richer UI 
 2.  Run the React app:
     ```bash
     cd frontend
-    NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:5001 npm run dev
+    NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:5001 pnpm dev
     ```
     Visit http://localhost:3000 and use `call_center_metrics` with `ts`/`y` for the seeded dummy data.
 
