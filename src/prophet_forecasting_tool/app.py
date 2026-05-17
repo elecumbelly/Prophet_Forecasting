@@ -15,11 +15,14 @@ import logging
 import os
 import pathlib
 import secrets
+import threading
+import time
+from collections import deque
 from typing import Any, Iterable, Optional
 
 import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 
 from prophet_forecasting_tool.config import Settings
 from prophet_forecasting_tool.data_loader import load_time_series
@@ -35,6 +38,10 @@ logger = logging.getLogger(__name__)
 # separate directory that is NOT served by the static route.
 PLOTS_DIR_NAME = "outputs_web"
 MODELS_DIR_NAME = "models_cache"
+
+# Auto-tune rate limit (per client IP).
+AUTOTUNE_LIMIT_COUNT = 3
+AUTOTUNE_LIMIT_WINDOW_SECONDS = 600
 
 
 def _parse_origins(value: Optional[str]) -> list[str]:
@@ -101,6 +108,75 @@ def _validate_columns_exist(engine, table: str, expected: Iterable[str]) -> None
         )
 
 
+def _jsonable_records(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Convert a DataFrame to JSON-safe rows.
+
+    Datetime columns are serialized with ``isoformat()`` so timezone offsets
+    and sub-second precision survive the round trip. NaT becomes ``None``.
+    """
+    if df.empty:
+        return []
+    safe = df.copy()
+    for col in safe.columns:
+        if pd.api.types.is_datetime64_any_dtype(safe[col]):
+            safe[col] = safe[col].apply(lambda x: x.isoformat() if pd.notna(x) else None)
+    return [{str(k): v for k, v in row.items()} for row in safe.to_dict(orient="records")]
+
+
+class _IpRateLimiter:
+    """Tiny in-process rate limiter keyed on client IP.
+
+    Thread-safe via a single lock. Per-IP deques hold recent request
+    timestamps; oldest entries are evicted lazily on each call. Empty
+    buckets are pruned every ``_PRUNE_EVERY`` calls so we don't accumulate
+    one entry per unique IP forever.
+    """
+
+    _PRUNE_EVERY = 256
+
+    def __init__(self, max_requests: int, window_seconds: float):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._buckets: dict[str, deque[float]] = {}
+        self._lock = threading.Lock()
+        self._calls_since_prune = 0
+
+    def _prune_locked(self, cutoff: float) -> None:
+        """Evict stale entries from every bucket and drop empty ones.
+
+        Lock must be held. ``cutoff`` is the monotonic-clock floor below
+        which timestamps are considered expired.
+        """
+        for bucket in self._buckets.values():
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()
+        self._buckets = {k: v for k, v in self._buckets.items() if v}
+
+    def allow(self, key: str) -> bool:
+        now = time.monotonic()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            bucket = self._buckets.setdefault(key, deque())
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()
+            self._calls_since_prune += 1
+            if self._calls_since_prune >= self._PRUNE_EVERY:
+                self._calls_since_prune = 0
+                self._prune_locked(cutoff)
+            if len(bucket) >= self.max_requests:
+                return False
+            bucket.append(now)
+            return True
+
+
+def _client_ip() -> str:
+    """Best-effort client IP, honouring X-Forwarded-For when behind a proxy."""
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
 def create_app(
     settings: Optional[Settings] = None,
     engine=None,
@@ -140,6 +216,9 @@ def create_app(
     app.config["MODELS_DIR"] = models_dir
     app.config["SERVICE"] = service
     app.config["ENGINE"] = engine
+    app.config["AUTOTUNE_LIMITER"] = _IpRateLimiter(
+        AUTOTUNE_LIMIT_COUNT, AUTOTUNE_LIMIT_WINDOW_SECONDS
+    )
 
     @app.after_request
     def add_cors_headers(response):
@@ -156,6 +235,17 @@ def create_app(
     def healthz():
         return jsonify({"status": "ok"})
 
+    @app.route("/readyz", methods=["GET"])
+    def readyz():
+        """Readiness probe: liveness AND a successful round-trip to the database."""
+        try:
+            with app.config["ENGINE"].connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return jsonify({"status": "ok", "database": "reachable"})
+        except Exception as e:
+            logger.warning(f"/readyz database check failed: {e}")
+            return jsonify({"status": "degraded", "database": "unreachable"}), 503
+
     @app.route("/get_columns/<table_name>", methods=["GET", "OPTIONS"])
     def get_columns(table_name):
         if request.method == "OPTIONS":
@@ -170,9 +260,9 @@ def create_app(
                 return jsonify({"error": f"Table {table_name} not found"}), 404
             columns = [col["name"] for col in inspector.get_columns(table_name)]
             return jsonify({"columns": columns})
-        except Exception as e:
+        except Exception:
             logger.exception(f"Error fetching columns for table {table_name}")
-            return jsonify({"error": str(e)}), 500
+            return jsonify({"error": "Internal server error"}), 500
 
     @app.route("/api/historical_data", methods=["POST", "OPTIONS"])
     def api_historical_data():
@@ -218,7 +308,7 @@ def create_app(
                     "table": table_name,
                     "row_count": len(df),
                     "columns": list(df.columns),
-                    "preview": data_preview.to_dict(orient="records"),
+                    "preview": _jsonable_records(data_preview),
                 }
             )
         except ValueError as e:
@@ -233,6 +323,25 @@ def create_app(
             return ("", 204)
 
         payload = request.get_json(silent=True) or {}
+        auto_tune = _bool_from_payload(payload.get("auto_tune"), default=False)
+
+        if auto_tune:
+            limiter: _IpRateLimiter = app.config["AUTOTUNE_LIMITER"]
+            if not limiter.allow(_client_ip()):
+                logger.info(f"Rate limit hit (auto-tune) for {_client_ip()}")
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                f"Auto-tune rate limit reached: "
+                                f"{AUTOTUNE_LIMIT_COUNT} runs per "
+                                f"{AUTOTUNE_LIMIT_WINDOW_SECONDS // 60} minutes."
+                            )
+                        }
+                    ),
+                    429,
+                )
+
         try:
             table_name = payload.get("table", "real_call_metrics")
             ts_column = payload.get("ts_column", "ds")
@@ -260,7 +369,7 @@ def create_app(
                 horizon=horizon,
                 series_name=str(payload.get("series_name") or "default_series"),
                 regressors=regressors,
-                auto_tune=_bool_from_payload(payload.get("auto_tune"), default=False),
+                auto_tune=auto_tune,
                 n_jobs=_int_from_payload(payload.get("n_jobs"), default=-1, lo=-1, hi=64),
                 resample_to_freq=payload.get("resample_to_freq") or None,
                 training_window_duration=training_window,
@@ -275,7 +384,7 @@ def create_app(
                 {
                     "series_name": results["series_name"],
                     "row_count": len(forecast_df),
-                    "preview": preview_df.to_dict(orient="records"),
+                    "preview": _jsonable_records(preview_df),
                     "forecast_plot": results.get("forecast_plot"),
                     "components_plot": results.get("components_plot"),
                     "day_breakdown_plot": results.get("day_breakdown_plot"),

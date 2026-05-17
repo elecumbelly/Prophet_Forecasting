@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import pandas as pd
 from sqlalchemy import Column, MetaData, Table, select
@@ -81,10 +81,10 @@ def load_time_series(
     try:
         metadata = MetaData()
         if columns_to_load:
-            tbl_cols = [Column(col_name) for col_name in columns_to_load]
+            tbl_cols: list[Column[Any]] = [Column(c) for c in columns_to_load]
             tbl = Table(table, metadata, *tbl_cols)
 
-            select_cols = []
+            select_cols: list[Any] = []
             for col_name in columns_to_load:
                 if col_name == ts_column:
                     select_cols.append(tbl.c[col_name].label("ds"))
@@ -94,7 +94,7 @@ def load_time_series(
                     select_cols.append(tbl.c[col_name])
             stmt = select(*select_cols).select_from(tbl)
         else:
-            columns = [Column(ts_column), Column(y_column)]
+            columns: list[Column[Any]] = [Column(ts_column), Column(y_column)]
             known_cols = {ts_column, y_column}
             if filters:
                 for col_name in filters.keys():
@@ -108,16 +108,19 @@ def load_time_series(
                         known_cols.add(col_name)
 
             tbl = Table(table, metadata, *columns)
-            selection = [tbl.c[ts_column].label("ds"), tbl.c[y_column].label("y")]
+            selection: list[Any] = [tbl.c[ts_column].label("ds"), tbl.c[y_column].label("y")]
             if regressors:
                 for col_name in regressors:
                     selection.append(tbl.c[col_name])
             stmt = select(*selection)
 
+        # Coerce pandas Timestamps to Python datetimes — SQLite's DB-API
+        # driver doesn't accept ``pd.Timestamp`` as a bind parameter; Postgres
+        # is more lenient but datetime works everywhere.
         if start is not None and pd.notna(start):
-            stmt = stmt.where(tbl.c[ts_column] >= start)
+            stmt = stmt.where(tbl.c[ts_column] >= pd.Timestamp(start).to_pydatetime())
         if end is not None and pd.notna(end):
-            stmt = stmt.where(tbl.c[ts_column] <= end)
+            stmt = stmt.where(tbl.c[ts_column] <= pd.Timestamp(end).to_pydatetime())
         if filters:
             for key, value in filters.items():
                 stmt = stmt.where(tbl.c[key] == value)
@@ -130,7 +133,7 @@ def load_time_series(
         if ts_column in df.columns and ts_column != "ds":
             df = df.rename(columns={ts_column: "ds"})
         df["ds"] = pd.to_datetime(df["ds"])
-        if pd.api.types.is_datetime64tz_dtype(df["ds"]):
+        if isinstance(df["ds"].dtype, pd.DatetimeTZDtype):
             df["ds"] = df["ds"].dt.tz_localize(None)
 
         if resample_to_freq:
@@ -142,7 +145,7 @@ def load_time_series(
                     agg_dict[col] = "sum"
                 else:
                     agg_dict[col] = _aggregation_for(col, df[col].dtype)
-            df = df.resample(resample_to_freq).agg(agg_dict).reset_index()
+            df = df.resample(resample_to_freq).agg(cast(Any, agg_dict)).reset_index()
             df = df.dropna(subset=["y"]).reset_index(drop=True)
             logger.info(f"Resampled to {resample_to_freq}: {len(df)} rows.")
 

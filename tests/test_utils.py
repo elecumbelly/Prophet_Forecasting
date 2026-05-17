@@ -116,3 +116,30 @@ class TestNormalizeTzNaive:
 
     def test_none(self):
         assert normalize_tz_naive(None) is None
+
+
+class TestFrontendDurationParity:
+    """Verify Python parses every duration form the frontend's previewDuration accepts.
+
+    The TypeScript helper ``previewDuration`` in ``frontend/src/lib/api.ts``
+    shows users "→ X day(s)" hints while they type. If Python's
+    ``parse_duration`` rejected anything the UI accepted, the user would see
+    a valid-looking preview followed by a 400 from the API. This test pins
+    that contract.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            # Compact unit-letter forms.
+            "90D", "1D", "365D", "12M", "24M", "1Y", "2Y", "10Y",
+            "6H", "12H", "24H", "4W", "8W",
+            # Spaced + spelled-out forms.
+            "365 days", "1 day", "12 months", "2 years", "4 weeks",
+            "24 hours", "30 minutes",
+            # Compact min.
+            "15min", "60min",
+        ],
+    )
+    def test_parses_without_error(self, value):
+        parse_duration(value)

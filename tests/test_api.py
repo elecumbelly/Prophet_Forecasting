@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from prophet_forecasting_tool.app import create_app
+from prophet_forecasting_tool.app import _IpRateLimiter, create_app
 
 
 @pytest.fixture
@@ -52,6 +52,23 @@ class TestHealth:
         resp = client.get("/healthz")
         assert resp.status_code == 200
         assert resp.json == {"status": "ok"}
+
+
+class TestReady:
+    def test_db_reachable(self, client, mock_engine):
+        conn = MagicMock()
+        conn.__enter__ = MagicMock(return_value=conn)
+        conn.__exit__ = MagicMock(return_value=False)
+        mock_engine.connect.return_value = conn
+        resp = client.get("/readyz")
+        assert resp.status_code == 200
+        assert resp.json["status"] == "ok"
+
+    def test_db_unreachable(self, client, mock_engine):
+        mock_engine.connect.side_effect = RuntimeError("connection refused")
+        resp = client.get("/readyz")
+        assert resp.status_code == 503
+        assert resp.json["status"] == "degraded"
 
 
 class TestGetColumns:
@@ -151,6 +168,10 @@ class TestApiForecast:
         assert body["series_name"] == "test_series"
         assert body["row_count"] == 5
         assert body["forecast_plot"].startswith("data:image/png")
+        # ds must be JSON-safe (ISO-8601 string, not a Timestamp object).
+        first_row = body["preview"][0]
+        assert isinstance(first_row["ds"], str)
+        assert first_row["ds"].startswith("2024-01-01T")
         mock_service.get_forecast.assert_called_once()
 
     def test_invalid_horizon(self, client):
@@ -249,3 +270,79 @@ class TestServeOutputs:
     def test_rejects_unknown_extension(self, client):
         resp = client.get("/outputs_web/somefile.exe")
         assert resp.status_code == 404
+
+
+class TestAutoTuneRateLimit:
+    @patch("prophet_forecasting_tool.app.inspect")
+    def test_blocks_after_threshold(self, mock_inspect, client, mock_service):
+        inspector = MagicMock()
+        inspector.has_table.return_value = True
+        inspector.get_columns.return_value = [{"name": "ts"}, {"name": "y"}]
+        mock_inspect.return_value = inspector
+
+        payload = {
+            "table": "demo",
+            "ts_column": "ts",
+            "y_column": "y",
+            "freq": "D",
+            "horizon": "30D",
+            "series_name": "test",
+            "regressors": [],
+            "auto_tune": True,
+        }
+
+        # First 3 requests must pass (AUTOTUNE_LIMIT_COUNT = 3).
+        for _ in range(3):
+            resp = client.post("/api/forecast", json=payload)
+            assert resp.status_code == 200
+
+        # 4th request from the same client is rejected with 429.
+        resp = client.post("/api/forecast", json=payload)
+        assert resp.status_code == 429
+        assert "rate limit" in resp.json["error"].lower()
+
+    def test_empty_buckets_are_pruned(self):
+        """Long-running services must not accumulate one bucket per unique IP forever."""
+        import time
+
+        limiter = _IpRateLimiter(max_requests=2, window_seconds=0.01)
+        # First record an IP that we'll let expire.
+        for i in range(50):
+            limiter.allow(f"10.0.0.{i}")
+        assert len(limiter._buckets) == 50
+
+        # Sleep long enough for the window to expire.
+        time.sleep(0.05)
+
+        # Now hammer allow() from a single IP to trip the prune. Each call
+        # also evicts the stale timestamp from "10.0.0.<i>" (which we never
+        # touch again), leaving those buckets empty. The prune wipes them.
+        for _ in range(_IpRateLimiter._PRUNE_EVERY + 1):
+            limiter.allow("repeat")
+
+        # All 50 one-shot IPs should have been pruned; only "repeat" remains.
+        assert len(limiter._buckets) <= 1, (
+            f"Bucket dict grew unbounded: {len(limiter._buckets)} entries"
+        )
+
+    @patch("prophet_forecasting_tool.app.inspect")
+    def test_non_autotune_not_limited(self, mock_inspect, client, mock_service):
+        inspector = MagicMock()
+        inspector.has_table.return_value = True
+        inspector.get_columns.return_value = [{"name": "ts"}, {"name": "y"}]
+        mock_inspect.return_value = inspector
+
+        payload = {
+            "table": "demo",
+            "ts_column": "ts",
+            "y_column": "y",
+            "freq": "D",
+            "horizon": "30D",
+            "series_name": "test",
+            "regressors": [],
+            "auto_tune": False,
+        }
+        # 10 non-auto-tune requests in a row must all pass.
+        for _ in range(10):
+            resp = client.post("/api/forecast", json=payload)
+            assert resp.status_code == 200

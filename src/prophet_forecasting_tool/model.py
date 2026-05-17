@@ -127,7 +127,7 @@ def train_prophet_model(
         raise ValueError("Input DataFrame must contain 'ds' and 'y' columns.")
 
     # Prophet rejects tz-aware ds; normalize defensively.
-    if pd.api.types.is_datetime64tz_dtype(df["ds"]):
+    if isinstance(df["ds"].dtype, pd.DatetimeTZDtype):
         df = df.copy()
         df["ds"] = df["ds"].dt.tz_localize(None)
 
@@ -207,7 +207,8 @@ def get_uk_bank_holidays(years: Optional[List[int]] = None) -> pd.DataFrame:
         current_year = pd.Timestamp.now().year
         years = list(range(current_year - 5, current_year + 6))
 
-    uk_holidays = holidays.UK(years=years)
+    # ``holidays.UK`` is a runtime alias; type stubs ship the new name.
+    uk_holidays = holidays.country_holidays("GB", years=years)
 
     rows = []
     for date, name in uk_holidays.items():
