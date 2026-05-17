@@ -33,7 +33,11 @@ app.log
 
 # Project specific
 outputs_web/models/*.json
+outputs_web/*.png
+outputs_web/*.csv
 outputs/
+models_cache/
+logs/
 
 # Jupyter
 .ipynb_checkpoints/

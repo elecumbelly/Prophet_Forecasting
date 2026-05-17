@@ -13,9 +13,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Prophet Forecasting UI",
+  title: "Prophet Forecasting",
   description:
-    "Shadcn-powered front end for exploring Prophet forecasts and historical metrics.",
+    "Inspect historical metrics and generate Prophet forecasts against a PostgreSQL backend.",
 };
 
 export default function RootLayout({

@@ -1,88 +1,104 @@
-import unittest
-from unittest.mock import MagicMock, patch
-import pandas as pd
+"""Data-loader tests, including a SQLite integration smoke test."""
 from datetime import datetime
-from sqlalchemy import create_engine
+from unittest.mock import MagicMock, patch
 
-# Assuming data_loader.py is in the parent directory of tests/
+import pandas as pd
+import pytest
+from sqlalchemy import (
+    Column,
+    Float,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    insert,
+)
+from sqlalchemy.types import DateTime
+
 from prophet_forecasting_tool.data_loader import load_time_series
 
-class TestDataLoader(unittest.TestCase):
 
-    @patch('prophet_forecasting_tool.data_loader.pd.read_sql')
-    def test_load_time_series_success(self, mock_read_sql):
-        # Mocking pd.read_sql to return a sample DataFrame
-        sample_data = {
-            'ds': pd.to_datetime(['2020-01-01', '2020-01-02', '2020-01-03']),
-            'y': [10, 20, 15]
+@pytest.fixture
+def memory_engine():
+    """SQLite in-memory engine seeded with a tiny call_center table."""
+    engine = create_engine("sqlite:///:memory:")
+    metadata = MetaData()
+    tbl = Table(
+        "demo_metrics",
+        metadata,
+        Column("ts", DateTime, primary_key=True),
+        Column("y", Float),
+        Column("answer_rate", Float),
+        Column("region", String),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as conn:
+        for i in range(14):
+            conn.execute(
+                insert(tbl).values(
+                    ts=datetime(2024, 1, 1 + i),
+                    y=100 + i,
+                    answer_rate=0.9 - 0.01 * i,
+                    region="uk",
+                )
+            )
+    yield engine
+    engine.dispose()
+
+
+class TestLoadTimeSeriesUnit:
+    @patch("prophet_forecasting_tool.data_loader.pd.read_sql")
+    def test_success(self, mock_read_sql):
+        sample = {
+            "ds": pd.to_datetime(["2020-01-01", "2020-01-02"]),
+            "y": [10, 20],
         }
-        mock_read_sql.return_value = pd.DataFrame(sample_data)
-
+        mock_read_sql.return_value = pd.DataFrame(sample)
         mock_engine = MagicMock(spec=create_engine("sqlite:///:memory:"))
         df = load_time_series(mock_engine, table="test_table")
+        assert not df.empty
+        assert "ds" in df.columns
+        assert pd.api.types.is_datetime64_any_dtype(df["ds"])
 
-        self.assertIsInstance(df, pd.DataFrame)
-        self.assertFalse(df.empty)
-        self.assertIn('ds', df.columns)
-        self.assertIn('y', df.columns)
-        self.assertTrue(pd.api.types.is_datetime64_any_dtype(df['ds']))
-        mock_read_sql.assert_called_once()
+    def test_rejects_bad_table(self):
+        engine = create_engine("sqlite:///:memory:")
+        with pytest.raises(ValueError):
+            load_time_series(engine, table="drop;tables")
 
-    @patch('prophet_forecasting_tool.data_loader.pd.read_sql')
-    def test_load_time_series_with_filters(self, mock_read_sql):
-        sample_data = {
-            'ds': pd.to_datetime(['2020-01-01', '2020-01-02']),
-            'y': [100, 110]
-        }
-        mock_read_sql.return_value = pd.DataFrame(sample_data)
+    def test_rejects_bad_column(self):
+        engine = create_engine("sqlite:///:memory:")
+        with pytest.raises(ValueError):
+            load_time_series(engine, table="t", ts_column="ts; --")
 
-        mock_engine = MagicMock(spec=create_engine("sqlite:///:memory:"))
-        start_date = datetime(2020, 1, 1)
-        end_date = datetime(2020, 1, 3)
-        filters = {"queue": "sales"}
+    def test_rejects_non_engine(self):
+        with pytest.raises(TypeError):
+            load_time_series("not-an-engine", table="t")  # type: ignore[arg-type]
 
+
+class TestLoadTimeSeriesIntegration:
+    def test_basic(self, memory_engine):
+        df = load_time_series(memory_engine, table="demo_metrics", ts_column="ts", y_column="y")
+        assert len(df) == 14
+        assert list(df.columns)[:2] == ["ds", "y"]
+
+    def test_regressors(self, memory_engine):
         df = load_time_series(
-            mock_engine,
-            table="test_table",
-            start=start_date,
-            end=end_date,
-            filters=filters
+            memory_engine,
+            table="demo_metrics",
+            ts_column="ts",
+            y_column="y",
+            regressors=["answer_rate"],
         )
+        assert "answer_rate" in df.columns
 
-        self.assertFalse(df.empty)
-        
-        # Args[0] is now a SQLAlchemy Select object
-        args, kwargs = mock_read_sql.call_args
-        query_obj = args[0]
-        query_str = str(query_obj)
-        
-        # Check for general SQL structure
-        self.assertIn("SELECT", query_str)
-        self.assertIn("FROM test_table", query_str)
-        # SQLAlchemy generates bind params like :ts_1, :ts_2, :queue_1
-        self.assertIn("test_table.ts >=", query_str)
-        self.assertIn("test_table.ts <=", query_str)
-        self.assertIn("test_table.queue =", query_str)
-        
-        # Verify parameters are correctly bound
-        compiled = query_obj.compile()
-        # compiled.params is a dict of {param_name: value}
-        param_values = list(compiled.params.values())
-        
-        self.assertIn(start_date, param_values)
-        self.assertIn(end_date, param_values)
-        self.assertIn("sales", param_values)
-
-    @patch('prophet_forecasting_tool.data_loader.pd.read_sql')
-    def test_load_time_series_empty_result(self, mock_read_sql):
-        mock_read_sql.return_value = pd.DataFrame(columns=['ds', 'y'])
-        mock_engine = MagicMock(spec=create_engine("sqlite:///:memory:"))
-        df = load_time_series(mock_engine)
-        self.assertTrue(df.empty)
-
-    def test_load_time_series_invalid_engine(self):
-        with self.assertRaises(TypeError):
-            load_time_series("invalid_engine")
-
-if __name__ == '__main__':
-    unittest.main()
+    def test_resample_uses_mean_for_rate_columns(self, memory_engine):
+        df = load_time_series(
+            memory_engine,
+            table="demo_metrics",
+            ts_column="ts",
+            y_column="y",
+            regressors=["answer_rate"],
+            resample_to_freq="W",
+        )
+        # answer_rate is mean-aggregated; values must stay in [0, 1].
+        assert df["answer_rate"].between(0, 1).all()

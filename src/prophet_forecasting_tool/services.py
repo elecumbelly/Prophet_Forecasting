@@ -1,39 +1,147 @@
-import pandas as pd
+"""Forecasting orchestration: load → outlier check → tune → train → forecast → plot.
+
+This service is shared by the CLI and the Flask JSON API. Plot rendering uses
+Matplotlib's OO API rather than pyplot, so concurrent requests don't fight over
+the global figure manager.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import io
+import json
 import logging
 import pathlib
-import hashlib
-from typing import Dict, List, Any, Optional
+import threading
+from typing import Any, Dict, List, Optional
 
+import pandas as pd
+from matplotlib.figure import Figure
 from sqlalchemy.engine import Engine
 
 from prophet_forecasting_tool.config import Settings
-from prophet_forecasting_tool.data_loader import load_time_series, get_max_date_for_table
-from prophet_forecasting_tool.model import (
-    train_prophet_model, 
-    forecast_with_prophet, 
-    get_uk_bank_holidays, 
-    save_model, 
-    load_model, 
-    tune_hyperparameters
-)
+from prophet_forecasting_tool.data_loader import get_max_date_for_table, load_time_series
 from prophet_forecasting_tool.evaluate import evaluate_with_cross_validation
+from prophet_forecasting_tool.model import (
+    forecast_with_prophet,
+    get_uk_bank_holidays,
+    load_model,
+    save_model,
+    train_prophet_model,
+    tune_hyperparameters,
+)
+from prophet_forecasting_tool.utils import (
+    duration_to_periods,
+    parse_duration,
+    shift_timestamp,
+    validate_identifier,
+)
 
 logger = logging.getLogger(__name__)
 
+# Per-process lock registry keyed by model hash to avoid concurrent
+# train/save races within a single worker.
+_MODEL_LOCKS: Dict[str, threading.Lock] = {}
+_REGISTRY_LOCK = threading.Lock()
+
+
+def _lock_for(model_hash: str) -> threading.Lock:
+    with _REGISTRY_LOCK:
+        lock = _MODEL_LOCKS.get(model_hash)
+        if lock is None:
+            lock = threading.Lock()
+            _MODEL_LOCKS[model_hash] = lock
+        return lock
+
+
+def _fig_to_base64(fig: Figure) -> str:
+    img = io.BytesIO()
+    fig.savefig(img, format="png", bbox_inches="tight")
+    img.seek(0)
+    return "data:image/png;base64," + base64.b64encode(img.getvalue()).decode("utf-8")
+
+
 class ForecastingService:
-    def __init__(self, engine: Engine, settings: Settings, models_dir: pathlib.Path):
+    """Orchestrates the forecast lifecycle and isolates plotting from the web layer."""
+
+    def __init__(
+        self,
+        engine: Engine,
+        settings: Settings,
+        models_dir: pathlib.Path,
+        actual_calls_table: str = "actual_calls",
+    ):
         self.engine = engine
         self.settings = settings
-        self.models_dir = models_dir
-        self.models_dir.mkdir(parents=True, exist_ok=True) # Ensure models directory exists
+        self.models_dir = pathlib.Path(models_dir)
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        self.actual_calls_table = actual_calls_table
 
-    def _generate_data_fingerprint(self, df: pd.DataFrame) -> str:
-        """Generates a hash based on key data characteristics to detect changes."""
+    def _data_fingerprint(self, df: pd.DataFrame) -> str:
+        """Hash row count, min/max date, and y stats so corrections invalidate."""
         if df.empty:
             return "empty_data"
-        max_date_str = str(df['ds'].max())
-        row_count = len(df)
-        return hashlib.md5(f"{max_date_str}_{row_count}".encode('utf-8')).hexdigest()
+        payload = (
+            f"{df['ds'].min().isoformat()}|"
+            f"{df['ds'].max().isoformat()}|"
+            f"{len(df)}|"
+            f"{float(df['y'].sum()):.6f}|"
+            f"{float(df['y'].mean()):.6f}"
+        )
+        return hashlib.md5(payload.encode("utf-8"), usedforsecurity=False).hexdigest()
+
+    def _model_path(
+        self,
+        *,
+        table_name: str,
+        ts_column: str,
+        y_column: str,
+        series_name: str,
+        freq: str,
+        regressors: List[str],
+        auto_tune: bool,
+        resample_to_freq: Optional[str],
+        training_window_duration: str,
+        remove_outliers: bool,
+        data_fingerprint: str,
+    ) -> pathlib.Path:
+        key = json.dumps(
+            {
+                "table": table_name,
+                "ts": ts_column,
+                "y": y_column,
+                "series": series_name,
+                "freq": freq,
+                "regressors": sorted(regressors),
+                "auto_tune": auto_tune,
+                "resample": resample_to_freq or "",
+                "window": training_window_duration,
+                "outliers": remove_outliers,
+                "fp": data_fingerprint,
+            },
+            sort_keys=True,
+        )
+        model_hash = hashlib.md5(key.encode("utf-8"), usedforsecurity=False).hexdigest()
+        return self.models_dir / f"model_{model_hash}.json"
+
+    @staticmethod
+    def _filter_outliers(df: pd.DataFrame, holidays_df: Optional[pd.DataFrame]) -> tuple[pd.DataFrame, int]:
+        """IQR outlier removal that preserves known holiday rows."""
+        if df.empty:
+            return df, 0
+        protected = set()
+        if holidays_df is not None and not holidays_df.empty:
+            protected = set(pd.to_datetime(holidays_df["ds"]).dt.normalize().tolist())
+        ds_normalized = df["ds"].dt.normalize() if pd.api.types.is_datetime64_any_dtype(df["ds"]) else df["ds"]
+        is_protected = ds_normalized.isin(protected)
+
+        Q1 = df["y"].quantile(0.25)
+        Q3 = df["y"].quantile(0.75)
+        iqr = Q3 - Q1
+        lower, upper = Q1 - 1.5 * iqr, Q3 + 1.5 * iqr
+        outlier_mask = ((df["y"] < lower) | (df["y"] > upper)) & ~is_protected
+        kept = df.loc[~outlier_mask].copy()
+        return kept, int(outlier_mask.sum())
 
     def get_forecast(
         self,
@@ -46,240 +154,274 @@ class ForecastingService:
         regressors: List[str],
         auto_tune: bool = False,
         n_jobs: int = -1,
-        resample_to_freq: Optional[str] = None, # New parameter
-        training_window_duration: str = "730 days", # New parameter
+        resample_to_freq: Optional[str] = None,
+        training_window_duration: str = "730 days",
+        remove_outliers: bool = False,
         output_dir: Optional[pathlib.Path] = None,
     ) -> Dict[str, Any]:
-        """
-        Orchestrates data loading, model training/loading, forecasting, and plotting.
-        Returns a dictionary of results for rendering or saving.
-        """
-        try:
-            # 1. Determine Required Data Range for Loading
-            latest_db_date = get_max_date_for_table(self.engine, table_name, ts_column)
-            if latest_db_date is None:
-                raise ValueError(f"No data found in table '{table_name}' or ts_column '{ts_column}' is empty.")
+        """Run the full forecast pipeline and return forecast_df + plot artifacts."""
+        validate_identifier(table_name, "table")
+        validate_identifier(ts_column, "column")
+        validate_identifier(y_column, "column")
+        for r in regressors:
+            validate_identifier(r, "regressor column")
 
-            # Calculate the effective start and end dates for loading data
-            td_training_window = pd.to_timedelta(training_window_duration)
-            td_horizon = pd.to_timedelta(horizon)
-            
-            # The data must start at least 'training_window_duration' before latest_db_date
-            # Add a buffer (e.g., another horizon) to ensure enough historical data for any pre-processing,
-            # and to allow Prophet to identify changepoints properly.
-            data_load_start = latest_db_date - td_training_window - td_horizon # Buffer for model needs
-            data_load_end = latest_db_date + td_horizon
+        # Validate durations early so the UI gets a friendly error.
+        parse_duration(horizon)
+        parse_duration(training_window_duration)
 
-            logger.info(f"Loading data from {data_load_start} to {latest_db_date}...")
-
-            df = load_time_series(
-                self.engine,
-                table=table_name,
-                ts_column=ts_column,
-                y_column=y_column,
-                regressors=regressors,
-                resample_to_freq=resample_to_freq,
-                start=data_load_start, # Pass calculated start
-                end=latest_db_date,    # Only load up to latest actual data
+        latest_db_date = get_max_date_for_table(self.engine, table_name, ts_column)
+        if latest_db_date is None:
+            raise ValueError(
+                f"No data found in table '{table_name}' or ts_column '{ts_column}' is empty."
             )
-            if df.empty:
-                raise ValueError(f"No data found in table '{table_name}' for forecasting within the calculated range.")
 
-            # 2. Prepare Training Data - use ALL available data for training
-            train_df = df.copy()
+        # Pull enough history for the requested training window (plus a horizon
+        # buffer so Prophet can place changepoints) AND any future regressor
+        # values needed for the forecast window.
+        data_load_start = shift_timestamp(latest_db_date, training_window_duration, subtract=True)
+        data_load_start = shift_timestamp(data_load_start, horizon, subtract=True)
+        future_regressor_end = shift_timestamp(latest_db_date, horizon)
 
-            if train_df.empty:
-                raise ValueError("Not enough data for training.")
+        logger.info(
+            f"Loading data: {data_load_start.date()} → {future_regressor_end.date()} "
+            f"(table={table_name}, regressors={regressors})"
+        )
 
-            # Remove outliers using IQR method
-            Q1 = train_df['y'].quantile(0.25)
-            Q3 = train_df['y'].quantile(0.75)
-            IQR = Q3 - Q1
-            lower_bound = Q1 - 1.5 * IQR
-            upper_bound = Q3 + 1.5 * IQR
+        full_df = load_time_series(
+            self.engine,
+            table=table_name,
+            ts_column=ts_column,
+            y_column=y_column,
+            regressors=regressors,
+            resample_to_freq=resample_to_freq,
+            start=data_load_start,
+            end=future_regressor_end,
+        )
+        if full_df.empty:
+            raise ValueError(
+                f"No data returned from table '{table_name}' for the requested range."
+            )
 
-            outliers_count = len(train_df[(train_df['y'] < lower_bound) | (train_df['y'] > upper_bound)])
-            train_df = train_df[(train_df['y'] >= lower_bound) & (train_df['y'] <= upper_bound)]
-            logger.info(f"Removed {outliers_count} outliers (IQR method). Bounds: [{lower_bound:.0f}, {upper_bound:.0f}]")
+        # Training data: rows where y is known and within the training window.
+        train_window_start = shift_timestamp(latest_db_date, training_window_duration, subtract=True)
+        train_df = full_df.loc[
+            (full_df["ds"] >= train_window_start) & (full_df["ds"] <= latest_db_date)
+        ].copy()
+        train_df = train_df.dropna(subset=["y"]).reset_index(drop=True)
+        if train_df.empty:
+            raise ValueError("Not enough data in the training window after filtering.")
 
-            logger.info(f"Training data range: {train_df['ds'].min()} to {train_df['ds'].max()} ({len(train_df)} rows)")
+        # Holidays for the full span the model will see (history + horizon).
+        year_min = min(train_df["ds"].min().year, latest_db_date.year)
+        year_max = max(future_regressor_end.year, latest_db_date.year)
+        holidays_df = get_uk_bank_holidays(years=list(range(year_min, year_max + 1)))
 
-            # 3. Generate Model ID & Handle Caching
-            data_fingerprint = self._generate_data_fingerprint(train_df)
-            regressors_str = ",".join(sorted(regressors))
-            tune_str = "_tuned" if auto_tune else ""
-            model_id_str = f"{table_name}_{ts_column}_{y_column}_{series_name}_{regressors_str}_{data_fingerprint}{tune_str}_{training_window_duration}_{resample_to_freq}"
-            model_hash = hashlib.md5(model_id_str.encode('utf-8')).hexdigest()
-            model_filename = f"model_{model_hash}.json"
-            model_path = self.models_dir / model_filename
+        outliers_count = 0
+        if remove_outliers:
+            train_df, outliers_count = self._filter_outliers(train_df, holidays_df)
+            logger.info(f"Removed {outliers_count} outliers (IQR, holidays preserved).")
 
-            model = None
+        # Build the future regressor frame from the loaded data.
+        # We require any regressor to have a non-null value within the forecast
+        # window. If the caller didn't supply it, we forward-fill from the last
+        # known value as a documented heuristic.
+        future_regressors_df: Optional[pd.DataFrame] = None
+        if regressors:
+            keep_cols = ["ds"] + regressors
+            future_regressors_df = full_df[keep_cols].copy()
+            future_regressors_df = future_regressors_df.sort_values("ds").reset_index(drop=True)
+            for r in regressors:
+                if future_regressors_df[r].isna().any():
+                    logger.info(
+                        f"Forward-filling missing future values for regressor '{r}'."
+                    )
+                    future_regressors_df[r] = future_regressors_df[r].ffill().bfill()
+
+        # Cache key/path includes everything that affects the trained weights.
+        data_fingerprint = self._data_fingerprint(train_df)
+        model_path = self._model_path(
+            table_name=table_name,
+            ts_column=ts_column,
+            y_column=y_column,
+            series_name=series_name,
+            freq=freq,
+            regressors=regressors,
+            auto_tune=auto_tune,
+            resample_to_freq=resample_to_freq,
+            training_window_duration=training_window_duration,
+            remove_outliers=remove_outliers,
+            data_fingerprint=data_fingerprint,
+        )
+        model_hash = model_path.stem
+
+        model = None
+        lock = _lock_for(model_hash)
+        with lock:
             if model_path.exists():
-                logger.info(f"Attempting to load existing model from {model_path}...")
                 try:
                     model = load_model(str(model_path))
-                    logger.info(f"Loaded cached model for {series_name} (Tuned: {auto_tune}).")
+                    logger.info(f"Loaded cached model {model_hash}")
                 except Exception as e:
-                    logger.warning(f"Failed to load cached model: {e}. Retraining...")
+                    logger.warning(f"Cached model failed to load ({e}); retraining.")
                     model = None
-            
-            # 4. Train Model (if not loaded from cache)
+
             if model is None:
-                prophet_kwargs = {
+                prophet_kwargs: Dict[str, Any] = {
                     "n_changepoints": 25,
                     "changepoint_range": 0.8,
                 }
-                holidays_df = get_uk_bank_holidays()
-                
                 if auto_tune:
-                    logger.info("Auto-tuning hyperparameters... this may take a while.")
+                    logger.info("Auto-tuning hyperparameters; this may take a while.")
                     best_params = tune_hyperparameters(
                         train_df,
                         freq=freq,
                         holidays_df=holidays_df,
                         regressors=regressors,
-                        n_jobs=n_jobs, # Pass n_jobs to tune_hyperparameters
-                        **prophet_kwargs
+                        n_jobs=n_jobs,
+                        **prophet_kwargs,
                     )
                     prophet_kwargs.update(best_params)
-                    logger.info(f"Tuning complete. Best params: {best_params}")
+                    logger.info(f"Best params: {best_params}")
 
                 model = train_prophet_model(
-                    train_df, 
-                    freq=freq, 
-                    seasonality_yearly="auto",
-                    seasonality_weekly="auto",
-                    seasonality_daily=False,
+                    train_df,
+                    freq=freq,
                     holidays_df=holidays_df,
                     regressors=regressors,
-                    **prophet_kwargs
+                    **prophet_kwargs,
                 )
-                
-                
-                # Save the trained model
                 try:
-                    save_model(model, str(model_path))
-                    logger.info(f"Model saved to {model_path}")
+                    tmp_path = model_path.with_suffix(".json.tmp")
+                    save_model(model, str(tmp_path))
+                    tmp_path.replace(model_path)
                 except Exception as e:
                     logger.error(f"Failed to save model: {e}")
-            
-            # 5. Generate Forecast
-            periods = int(td_horizon / pd.to_timedelta(1, unit=freq)) # Use td_horizon directly
-            forecast_df = forecast_with_prophet(
-                model, 
-                periods=periods, 
-                freq=freq,
-                future_regressors_df=df # Pass the full df containing potentially future regressor values
+
+        # 5. Forecast
+        periods = duration_to_periods(horizon, freq)
+        forecast_df = forecast_with_prophet(
+            model,
+            periods=periods,
+            freq=freq,
+            future_regressors_df=future_regressors_df,
+        )
+
+        # 6. Plots (OO matplotlib — no pyplot globals)
+        plot_results = self._render_plots(
+            model=model,
+            forecast_df=forecast_df,
+            train_df=train_df,
+            ts_column=ts_column,
+            y_column=y_column,
+            output_dir=output_dir,
+            series_name=series_name,
+        )
+
+        return {
+            "forecast_df": forecast_df,
+            "series_name": series_name,
+            "outliers_removed": outliers_count,
+            "training_rows": len(train_df),
+            "training_start": train_df["ds"].min().isoformat(),
+            "training_end": train_df["ds"].max().isoformat(),
+            **plot_results,
+        }
+
+    def _render_plots(
+        self,
+        *,
+        model,
+        forecast_df: pd.DataFrame,
+        train_df: pd.DataFrame,
+        ts_column: str,
+        y_column: str,
+        output_dir: Optional[pathlib.Path],
+        series_name: str,
+    ) -> Dict[str, Any]:
+        plot_results: Dict[str, Any] = {}
+
+        fig = model.plot(forecast_df)
+        ax = fig.gca()
+        ax.plot(train_df["ds"], train_df["y"], "k-", linewidth=1, label="Historical")
+
+        actual_df_full: Optional[pd.DataFrame] = None
+        try:
+            actual_df_full = load_time_series(
+                self.engine,
+                table=self.actual_calls_table,
+                ts_column=ts_column,
+                y_column=y_column,
+                columns_to_load=["ds", "day", "y", "answered_calls", "abandoned_calls"],
             )
-            
-            # 6. Generate Plots
-            # For web, return base64. For CLI, save to file.
-            plot_results = {}
-            if output_dir: # CLI output
-                import matplotlib.pyplot as plt # Moved local for web output before
-                import io # Moved local for web output before
-                import base64 # Moved local for web output before
-                output_dir.mkdir(parents=True, exist_ok=True)
-                fig = model.plot(forecast_df)
-                plot_path = output_dir / f"{series_name}_forecast_plot.png"
-                fig.savefig(plot_path)
-                plt.close(fig) # Close figure to free memory
-                plot_results['forecast_plot_path'] = str(plot_path)
-
-                fig_components = model.plot_components(forecast_df)
-                plot_components_path = output_dir / f"{series_name}_forecast_components_plot.png"
-                fig_components.savefig(plot_components_path)
-                plt.close(fig_components)
-                plot_results['components_plot_path'] = str(plot_components_path)
-            else: # Web output
-                # Using an internal function to avoid matplotlib import outside of this block
-                import matplotlib.pyplot as plt
-                import io
-                import base64
-
-                def fig_to_base64(fig):
-                    img = io.BytesIO()
-                    fig.savefig(img, format='png', bbox_inches='tight')
-                    img.seek(0)
-                    return "data:image/png;base64," + base64.b64encode(img.getvalue()).decode('utf-8')
-
-                fig = model.plot(forecast_df)
-                ax = fig.gca()
-
-                # Add black line for historical data
-                ax.plot(train_df['ds'], train_df['y'], 'k-', linewidth=1, label='Historical')
-
-                # Load and plot actual data in green
-                actual_df_full = None
-                try:
-                    actual_df_full = load_time_series(
-                        self.engine,
-                        table='actual_calls',
-                        ts_column=ts_column,
-                        y_column=y_column,
-                        columns_to_load=['ds', 'day', 'y', 'answered_calls', 'abandoned_calls'],
-                    )
-                    if not actual_df_full.empty:
-                        ax.plot(actual_df_full['ds'], actual_df_full['y'], 'g-', linewidth=1.5, label='Actual')
-                        ax.legend()
-                except Exception as e:
-                    logger.warning(f"Could not load actual_calls for plotting: {e}")
-
-                plot_results['forecast_plot'] = fig_to_base64(fig)
-                plt.close(fig)
-
-                fig_components = model.plot_components(forecast_df)
-                plot_results['components_plot'] = fig_to_base64(fig_components)
-                plt.close(fig_components)
-
-                # Create stacked bar chart for actual calls by day of week
-                if actual_df_full is not None and not actual_df_full.empty:
-                    try:
-                        # Map abbreviated days to full names
-                        day_map = {'mon': 'Monday', 'tue': 'Tuesday', 'wed': 'Wednesday',
-                                   'thu': 'Thursday', 'fri': 'Friday', 'sat': 'Saturday', 'sun': 'Sunday'}
-                        actual_df_full['day_full'] = actual_df_full['day'].str.lower().map(day_map)
-
-                        # Order days correctly
-                        day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-
-                        # Group by day and sum
-                        day_stats = actual_df_full.groupby('day_full').agg({
-                            'answered_calls': 'sum',
-                            'abandoned_calls': 'sum'
-                        }).reindex(day_order).fillna(0)
-
-                        fig_bar, ax_bar = plt.subplots(figsize=(10, 6))
-
-                        x = range(len(day_stats))
-                        width = 0.6
-
-                        # Stacked bar: green for answered, red for abandoned
-                        ax_bar.bar(x, day_stats['answered_calls'], width, label='Answered', color='green')
-                        ax_bar.bar(x, day_stats['abandoned_calls'], width, bottom=day_stats['answered_calls'], label='Abandoned', color='red')
-
-                        ax_bar.set_xlabel('Day of Week')
-                        ax_bar.set_ylabel('Number of Calls')
-                        ax_bar.set_title('Actual Calls by Day of Week (Answered vs Abandoned)')
-                        ax_bar.set_xticks(x)
-                        ax_bar.set_xticklabels(day_stats.index, rotation=45, ha='right')
-                        ax_bar.legend()
-
-                        plt.tight_layout()
-                        plot_results['day_breakdown_plot'] = fig_to_base64(fig_bar)
-                        plt.close(fig_bar)
-                    except Exception as e:
-                        logger.warning(f"Could not create day breakdown plot: {e}")
-            
-            return {
-                "forecast_df": forecast_df,
-                "series_name": series_name,
-                **plot_results
-            }
-
+            if actual_df_full is not None and not actual_df_full.empty:
+                ax.plot(actual_df_full["ds"], actual_df_full["y"], "g-", linewidth=1.5, label="Actual")
+                ax.legend()
         except Exception as e:
-            logger.exception(f"Error in ForecastingService.get_forecast: {e}")
-            raise
+            logger.debug(f"Skipped actuals overlay ({self.actual_calls_table}): {e}")
+
+        fig_components = model.plot_components(forecast_df)
+
+        if output_dir:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            forecast_path = output_dir / f"{series_name}_forecast_plot.png"
+            fig.savefig(forecast_path, bbox_inches="tight")
+            plot_results["forecast_plot_path"] = str(forecast_path)
+
+            components_path = output_dir / f"{series_name}_forecast_components_plot.png"
+            fig_components.savefig(components_path, bbox_inches="tight")
+            plot_results["components_plot_path"] = str(components_path)
+        else:
+            plot_results["forecast_plot"] = _fig_to_base64(fig)
+            plot_results["components_plot"] = _fig_to_base64(fig_components)
+
+        # Day-of-week breakdown from actuals.
+        if actual_df_full is not None and not actual_df_full.empty and "day" in actual_df_full.columns:
+            try:
+                day_map = {
+                    "mon": "Monday", "tue": "Tuesday", "wed": "Wednesday",
+                    "thu": "Thursday", "fri": "Friday", "sat": "Saturday", "sun": "Sunday",
+                }
+                actual_df_full["day_full"] = actual_df_full["day"].astype(str).str.lower().map(day_map)
+                day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+                if "answered_calls" in actual_df_full.columns and "abandoned_calls" in actual_df_full.columns:
+                    day_stats = (
+                        actual_df_full.groupby("day_full")
+                        .agg({"answered_calls": "sum", "abandoned_calls": "sum"})
+                        .reindex(day_order)
+                        .fillna(0)
+                    )
+                    fig_bar = Figure(figsize=(10, 6))
+                    ax_bar = fig_bar.subplots()
+                    x = range(len(day_stats))
+                    width = 0.6
+                    ax_bar.bar(x, day_stats["answered_calls"], width, label="Answered", color="green")
+                    ax_bar.bar(
+                        x,
+                        day_stats["abandoned_calls"],
+                        width,
+                        bottom=day_stats["answered_calls"],
+                        label="Abandoned",
+                        color="red",
+                    )
+                    ax_bar.set_xlabel("Day of Week")
+                    ax_bar.set_ylabel("Number of Calls")
+                    ax_bar.set_title("Actual Calls by Day of Week (Answered vs Abandoned)")
+                    ax_bar.set_xticks(list(x))
+                    ax_bar.set_xticklabels(day_stats.index, rotation=45, ha="right")
+                    ax_bar.legend()
+                    fig_bar.tight_layout()
+                    if output_dir:
+                        path = output_dir / f"{series_name}_day_breakdown_plot.png"
+                        fig_bar.savefig(path, bbox_inches="tight")
+                        plot_results["day_breakdown_plot_path"] = str(path)
+                    else:
+                        plot_results["day_breakdown_plot"] = _fig_to_base64(fig_bar)
+            except Exception as e:
+                logger.warning(f"Could not create day breakdown plot: {e}")
+
+        return plot_results
 
     def evaluate_model(
         self,
@@ -288,77 +430,74 @@ class ForecastingService:
         y_column: str,
         freq: str,
         metrics: List[str],
-        initial: str, # For CV
-        period: str, # For CV
-        horizon: str, # For CV
+        initial: str,
+        period: str,
+        horizon: str,
         regressors: List[str],
         n_jobs: int = -1,
-        resample_to_freq: Optional[str] = None, # New parameter
+        resample_to_freq: Optional[str] = None,
+        training_window_duration: Optional[str] = None,
         output_dir: Optional[pathlib.Path] = None,
         **prophet_kwargs,
     ) -> Dict[str, Any]:
-        """
-        Orchestrates data loading and model evaluation using cross-validation.
-        """
-        try:
-            # 1. Determine Required Data Range for Loading (for Cross-Validation)
-            latest_db_date = get_max_date_for_table(self.engine, table_name, ts_column)
-            if latest_db_date is None:
-                raise ValueError(f"No data found in table '{table_name}' or ts_column '{ts_column}' is empty for evaluation.")
-            
-            # Cross-validation needs data from latest_db_date back to (initial + (num_cutoffs * period) + horizon)
-            # A rough estimate for required start date: latest_db_date - initial - period - horizon (with buffer)
-            td_initial = pd.to_timedelta(initial)
-            td_period = pd.to_timedelta(period)
-            td_horizon = pd.to_timedelta(horizon)
-            
-            # Load enough data to cover all CV folds. This is a conservative estimate.
-            # Start = latest_db_date - (number of folds * period) - initial - horizon
-            # Assuming at least 3 folds for reasonable CV: 3 * td_period
-            data_load_start = latest_db_date - td_initial - (3 * td_period) - td_horizon
-            data_load_end = latest_db_date # CV uses historical data only
+        """Rolling-window CV evaluation mirroring the production training spec."""
+        validate_identifier(table_name, "table")
+        validate_identifier(ts_column, "column")
+        validate_identifier(y_column, "column")
+        for r in regressors:
+            validate_identifier(r, "regressor column")
+        parse_duration(initial)
+        parse_duration(period)
+        parse_duration(horizon)
 
-            logger.info(f"Loading data for evaluation from {data_load_start} to {data_load_end}...")
-
-            df = load_time_series(
-                self.engine, 
-                table=table_name, 
-                ts_column=ts_column, 
-                y_column=y_column,
-                regressors=regressors,
-                resample_to_freq=resample_to_freq, # Pass to data_loader
-                start=data_load_start, # Pass calculated start
-                end=data_load_end,     # Pass calculated end
-            )
-            if df.empty:
-                raise ValueError(f"No data found in table '{table_name}' for evaluation within the calculated range.")
-
-            calculated_metrics = evaluate_with_cross_validation(
-                df,
-                freq=freq,
-                metrics=metrics,
-                initial=initial,
-                period=period,
-                horizon=horizon,
-                n_jobs=n_jobs,
-                regressors=regressors, # Pass regressors
-                save_path=None, # Explicitly pass save_path=None as internal models shouldn't be saved
-                **prophet_kwargs,
+        latest_db_date = get_max_date_for_table(self.engine, table_name, ts_column)
+        if latest_db_date is None:
+            raise ValueError(
+                f"No data found in table '{table_name}' or ts_column '{ts_column}' is empty."
             )
 
+        # We need at least initial + 3*period + horizon of history for ≥3 folds.
+        start = shift_timestamp(latest_db_date, initial, subtract=True)
+        start = shift_timestamp(start, period, subtract=True)
+        start = shift_timestamp(start, period, subtract=True)
+        start = shift_timestamp(start, period, subtract=True)
+        start = shift_timestamp(start, horizon, subtract=True)
+
+        logger.info(f"Loading evaluation data: {start.date()} → {latest_db_date.date()}")
+        df = load_time_series(
+            self.engine,
+            table=table_name,
+            ts_column=ts_column,
+            y_column=y_column,
+            regressors=regressors,
+            resample_to_freq=resample_to_freq,
+            start=start,
+            end=latest_db_date,
+        )
+        if df.empty:
+            raise ValueError(
+                f"No data returned from table '{table_name}' for evaluation."
+            )
+
+        results = evaluate_with_cross_validation(
+            df,
+            freq=freq,
+            metrics=metrics,
+            initial=initial,
+            period=period,
+            horizon=horizon,
+            n_jobs=n_jobs,
+            regressors=regressors,
+            support_uk_holidays=True,
+            **prophet_kwargs,
+        )
+
+        if output_dir is not None:
+            output_dir = pathlib.Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
             metrics_output_path = output_dir / f"{table_name}_{ts_column}_{y_column}_cv_metrics.json"
-            metrics_output_path.parent.mkdir(parents=True, exist_ok=True)
             with open(metrics_output_path, "w") as f:
-                import json
-                json.dump(calculated_metrics, f, indent=4)
-            logger.info(f"Cross-Validation metrics saved to {metrics_output_path}")
+                json.dump(results, f, indent=4)
+            logger.info(f"CV metrics saved to {metrics_output_path}")
 
-            logger.info("Cross-Validation Metrics:")
-            for metric, value in calculated_metrics.items():
-                logger.info(f"  {metric.upper()}: {value:.4f}")
-            
-            return calculated_metrics
-
-        except Exception as e:
-            logger.exception(f"An error occurred in ForecastingService.evaluate_model: {e}")
-            raise
+        return results
